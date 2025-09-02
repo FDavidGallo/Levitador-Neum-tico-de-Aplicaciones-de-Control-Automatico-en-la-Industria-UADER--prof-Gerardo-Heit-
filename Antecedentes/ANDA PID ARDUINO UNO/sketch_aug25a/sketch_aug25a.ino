@@ -17,7 +17,7 @@ double integral = 0;
 double derivative;
 
 // Deadzone del PWM
-const int PWM_MIN = 3;  // 52% de 255 = 132.6 ≈ 130
+const int PWM_MIN = 0;  // 52% de 255 = 132.6 ≈ 130
 const int PWM_MAX = 255;
 const int PWM_DEADZONE = PWM_MIN;
 
