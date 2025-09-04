@@ -6,18 +6,18 @@ byte echoPin = 12;
 byte pwmPin = 6;
 
 // Variables PID
-double setpoint = 19.1;
+double setpoint = 14;
 double input, output;
-double Kp = 10.5;    // Reducido para planta lenta
-double Ki = 0.021;    // Reducido para planta lenta  
-double Kd = 0.024;    // Reducido para planta lenta
+double Kp = 4;    // Reducido para planta lenta
+double Ki = 0.09;    // Reducido para planta lenta  
+double Kd = 0.004;    // Reducido para planta lenta
 
-double error, lastError = 0;
+double error, lastError = 100;
 double integral = 0;
 double derivative;
 
 // Deadzone del PWM
-const int PWM_MIN = 0;  // 52% de 255 = 132.6 ≈ 130
+const int PWM_MIN = 50;  // 52% de 255 = 132.6 ≈ 130
 const int PWM_MAX = 255;
 const int PWM_DEADZONE = PWM_MIN;
 

@@ -12,6 +12,8 @@ import serial
 import threading
 import time
 from serial.tools import list_ports
+from scipy.special import erf
+from scipy.integrate import odeint
 
 class AdvancedTransferFunctionAnalyzer:
     def __init__(self, root):
@@ -170,35 +172,47 @@ class AdvancedTransferFunctionAnalyzer:
         self.status_var.set("Desconectado")
     
     def read_serial_data(self):
-        while self.is_reading and self.serial_port and self.serial_port.is_open:
-            try:
-                if self.serial_port.in_waiting > 0:
-                    line = self.serial_port.readline().decode().strip()
-                    if line:
-                        try:
-                            distance = float(line)
-                            current_time = time.time() - self.start_time
-                            current_pwm = int(self.pwm_value.get()) if self.pwm_value.get().isdigit() else 0
-                            
-                            # Agregar datos al DataFrame
-                            new_data = pd.DataFrame({
-                                'time_seconds': [current_time],
-                                'pwm': [current_pwm],
-                                'distance': [distance]
-                            })
-                            self.serial_data = pd.concat([self.serial_data, new_data], ignore_index=True)
-                            
-                            # Actualizar texto en tiempo real
-                            self.realtime_text.insert(tk.END, f"T: {current_time:.2f}s, PWM: {current_pwm}, Distancia: {distance}\n")
-                            self.realtime_text.see(tk.END)
-                            
-                        except ValueError:
-                            # Ignorar líneas que no se pueden convertir a float
-                            pass
-            except Exception as e:
-                print(f"Error en lectura serial: {str(e)}")
-                break
-            time.sleep(0.01)
+     while self.is_reading and self.serial_port and self.serial_port.is_open:
+        try:
+            if self.serial_port.in_waiting > 0:
+                line = self.serial_port.readline().decode().strip()
+                if line:
+                    try:
+                        distance = float(line)
+                        current_time = time.time() - self.start_time
+                        current_pwm = int(self.pwm_value.get()) if self.pwm_value.get().isdigit() else 0
+                        
+                        # Crear nuevo DataFrame con los mismos nombres de columnas
+                        new_data = pd.DataFrame({
+                            'time_seconds': [current_time],
+                            'pwm': [current_pwm],
+                            'distance': [distance]
+                        })
+                        
+                        # Asegurar que ambos DataFrames tienen las mismas columnas
+                        if self.serial_data.empty:
+                            self.serial_data = new_data
+                        else:
+                            # Verificar que las columnas coincidan
+                            if list(self.serial_data.columns) == list(new_data.columns):
+                                self.serial_data = pd.concat([self.serial_data, new_data], ignore_index=True)
+                            else:
+                                # Si las columnas no coinciden, reiniciar el DataFrame
+                                print("Advertencia: Estructura de columnas incompatible. Reiniciando DataFrame.")
+                                self.serial_data = new_data
+                        
+                        # Actualizar texto en tiempo real
+                        self.realtime_text.insert(tk.END, f"T: {current_time:.2f}s, PWM: {current_pwm}, Distancia: {distance}\n")
+                        self.realtime_text.see(tk.END)
+                        
+                    except ValueError:
+                        # Ignorar líneas que no se pueden convertir a float
+                        pass
+        except Exception as e:
+            print(f"Error en lectura serial: {str(e)}")
+            print(traceback.format_exc())
+            break
+        time.sleep(0.01)
     
     def send_pwm(self):
         if self.serial_port and self.serial_port.is_open:
@@ -221,7 +235,7 @@ class AdvancedTransferFunctionAnalyzer:
         
         # Barrido automático de PWM
         def sweep_thread():
-            pwm_values = list(range(0, 256, 25)) + list(range(255, -1, -10))
+            pwm_values = list(range(0, 150, 150)) + list(range(150, -1, -50))
             for pwm in pwm_values:
                 if not self.is_reading:
                     break
@@ -274,11 +288,15 @@ class AdvancedTransferFunctionAnalyzer:
     
     def advanced_analysis(self, data):
         # Preprocesamiento de datos
-        data_clean = data.dropna()
+        data_clean = data.dropna().reset_index(drop=True)
         
         # Identificar cambios de PWM
         pwm_diff = data_clean['pwm'].diff().fillna(0)
         step_indices = np.where(np.abs(pwm_diff) > 5)[0]
+        
+        # Añadir el último índice si no está incluido
+        if len(step_indices) > 0 and step_indices[-1] < len(data_clean) - 1:
+            step_indices = np.append(step_indices, len(data_clean) - 1)
         
         results = []
         
@@ -286,7 +304,7 @@ class AdvancedTransferFunctionAnalyzer:
             start_idx = step_indices[i]
             end_idx = step_indices[i + 1]
             
-            segment = data_clean.iloc[start_idx:end_idx].copy()
+            segment = data_clean.iloc[start_idx:end_idx].copy().reset_index(drop=True)
             
             if len(segment) < 20:  # Segmento demasiado corto
                 continue
@@ -301,7 +319,13 @@ class AdvancedTransferFunctionAnalyzer:
             y_ss = np.mean(y[-5:])  # Promedio de los últimos 5 puntos
             
             # Normalizar respuesta
-            y_norm = (y - y0) / (y_ss - y0) if (y_ss - y0) != 0 else y - y0
+            if (y_ss - y0) != 0:
+                y_norm = (y - y0) / (y_ss - y0)
+            else:
+                y_norm = y - y0
+            
+            # Detectar zona muerta y retardo
+            dead_zone, time_delay = self.detect_dead_zone_and_delay(t, y_norm)
             
             # Ajustar modelos
             try:
@@ -311,6 +335,19 @@ class AdvancedTransferFunctionAnalyzer:
                 
                 popt_1st, pcov_1st = curve_fit(first_order, t, y_norm, p0=[1, 1], maxfev=5000)
                 y_pred_1st = first_order(t, *popt_1st)
+                
+                # Modelo de primer orden con retardo
+                def first_order_with_delay(t, K, tau, L):
+                    # Usar aproximación de Padé para el retardo
+                    return np.where(t < L, 0, K * (1 - np.exp(-(t - L) / tau)))
+                
+                # Estimación inicial del retardo
+                L_guess = time_delay if time_delay > 0 else 0.1
+                popt_1std, pcov_1std = curve_fit(first_order_with_delay, t, y_norm, 
+                                                p0=[1, 1, L_guess], 
+                                                bounds=([0.1, 0.1, 0], [5, 100, t.max()/2]), 
+                                                maxfev=10000)
+                y_pred_1std = first_order_with_delay(t, *popt_1std)
                 
                 # Modelo de segundo orden
                 def second_order(t, K, tau, zeta):
@@ -327,52 +364,133 @@ class AdvancedTransferFunctionAnalyzer:
                 popt_2nd, pcov_2nd = curve_fit(second_order, t, y_norm, p0=[1, 1, 0.7], maxfev=10000)
                 y_pred_2nd = second_order(t, *popt_2nd)
                 
-                # Calcular métricas de error
+                # Modelo de segundo orden con retardo
+                def second_order_with_delay(t, K, tau, zeta, L):
+                    if zeta < 1:  # Subamortiguado
+                        omega_n = 1 / tau
+                        omega_d = omega_n * np.sqrt(1 - zeta**2)
+                        return np.where(t < L, 0, 
+                                       K * (1 - (np.exp(-zeta * omega_n * (t - L)) / np.sqrt(1 - zeta**2)) * 
+                                            np.sin(omega_d * (t - L) + np.arccos(zeta))))
+                    else:  # Sobreamortiguado
+                        # Aproximación a dos polos reales
+                        return np.where(t < L, 0, 
+                                       K * (1 - (tau / (tau - 1)) * np.exp(-(t - L) / tau) + 
+                                            (1 / (tau - 1)) * np.exp(-tau * (t - L))))
+                
+                popt_2ndd, pcov_2ndd = curve_fit(second_order_with_delay, t, y_norm, 
+                                                 p0=[1, 1, 0.7, L_guess], 
+                                                 bounds=([0.1, 0.1, 0.1, 0], [5, 100, 5, t.max()/2]), 
+                                                 maxfev=10000)
+                y_pred_2ndd = second_order_with_delay(t, *popt_2ndd)
+                
+                # Modelo de tercer orden
+                def third_order_model(t, K, tau1, tau2, tau3):
+                    # Sistema de tercer orden con tres constantes de tiempo
+                    def model_func(t, K, tau1, tau2, tau3):
+                        # Solución analítica para sistema de tercer orden
+                        A = tau2*tau3/((tau2-tau1)*(tau3-tau1))
+                        B = tau1*tau3/((tau1-tau2)*(tau3-tau2))
+                        C = tau1*tau2/((tau1-tau3)*(tau2-tau3))
+                        return K * (1 - A*np.exp(-t/tau1) - B*np.exp(-t/tau2) - C*np.exp(-t/tau3))
+                    
+                    return model_func(t, K, tau1, tau2, tau3)
+                
+                popt_3rd, pcov_3rd = curve_fit(third_order_model, t, y_norm, 
+                                              p0=[1, 1, 2, 3], 
+                                              bounds=([0.1, 0.1, 0.1, 0.1], [5, 10, 10, 10]), 
+                                              maxfev=10000)
+                y_pred_3rd = third_order_model(t, *popt_3rd)
+                
+                # Calcular métricas de error para todos los modelos
                 mse_1st = np.mean((y_norm - y_pred_1st) ** 2)
+                mse_1std = np.mean((y_norm - y_pred_1std) ** 2)
                 mse_2nd = np.mean((y_norm - y_pred_2nd) ** 2)
+                mse_2ndd = np.mean((y_norm - y_pred_2ndd) ** 2)
+                mse_3rd = np.mean((y_norm - y_pred_3rd) ** 2)
                 
                 r2_1st = 1 - np.sum((y_norm - y_pred_1st) ** 2) / np.sum((y_norm - np.mean(y_norm)) ** 2)
+                r2_1std = 1 - np.sum((y_norm - y_pred_1std) ** 2) / np.sum((y_norm - np.mean(y_norm)) ** 2)
                 r2_2nd = 1 - np.sum((y_norm - y_pred_2nd) ** 2) / np.sum((y_norm - np.mean(y_norm)) ** 2)
+                r2_2ndd = 1 - np.sum((y_norm - y_pred_2ndd) ** 2) / np.sum((y_norm - np.mean(y_norm)) ** 2)
+                r2_3rd = 1 - np.sum((y_norm - y_pred_3rd) ** 2) / np.sum((y_norm - np.mean(y_norm)) ** 2)
                 
-                # Test F para comparar modelos
-                ssr_1st = np.sum((y_norm - y_pred_1st) ** 2)
-                ssr_2nd = np.sum((y_norm - y_pred_2nd) ** 2)
-                
+                # Determinar mejor modelo basado en AIC (Akaike Information Criterion)
                 n = len(y_norm)
-                p1, p2 = 2, 3  # Parámetros en cada modelo
+                aic_1st = n * np.log(mse_1st) + 2 * 2  # 2 parámetros
+                aic_1std = n * np.log(mse_1std) + 2 * 3  # 3 parámetros
+                aic_2nd = n * np.log(mse_2nd) + 2 * 3  # 3 parámetros
+                aic_2ndd = n * np.log(mse_2ndd) + 2 * 4  # 4 parámetros
+                aic_3rd = n * np.log(mse_3rd) + 2 * 4  # 4 parámetros
                 
-                f_stat = ((ssr_1st - ssr_2nd) / (p2 - p1)) / (ssr_2nd / (n - p2))
-                p_value = 1 - stats.f.cdf(f_stat, p2 - p1, n - p2)
+                aic_values = {
+                    'Primer orden': aic_1st,
+                    'Primer orden con retardo': aic_1std,
+                    'Segundo orden': aic_2nd,
+                    'Segundo orden con retardo': aic_2ndd,
+                    'Tercer orden': aic_3rd
+                }
                 
-                # Determinar mejor modelo
-                best_model = "Primer orden" if mse_1st < mse_2nd and p_value > 0.05 else "Segundo orden"
+                best_model = min(aic_values, key=aic_values.get)
                 
                 results.append({
                     'segment': i + 1,
                     'pwm': u,
+                    'dead_zone': dead_zone,
+                    'time_delay': time_delay,
                     'first_order': {
                         'K': popt_1st[0],
                         'tau': popt_1st[1],
                         'mse': mse_1st,
-                        'r2': r2_1st
+                        'r2': r2_1st,
+                        'aic': aic_1st
+                    },
+                    'first_order_delay': {
+                        'K': popt_1std[0],
+                        'tau': popt_1std[1],
+                        'L': popt_1std[2],
+                        'mse': mse_1std,
+                        'r2': r2_1std,
+                        'aic': aic_1std
                     },
                     'second_order': {
                         'K': popt_2nd[0],
                         'tau': popt_2nd[1],
                         'zeta': popt_2nd[2],
                         'mse': mse_2nd,
-                        'r2': r2_2nd
+                        'r2': r2_2nd,
+                        'aic': aic_2nd
+                    },
+                    'second_order_delay': {
+                        'K': popt_2ndd[0],
+                        'tau': popt_2ndd[1],
+                        'zeta': popt_2ndd[2],
+                        'L': popt_2ndd[3],
+                        'mse': mse_2ndd,
+                        'r2': r2_2ndd,
+                        'aic': aic_2ndd
+                    },
+                    'third_order': {
+                        'K': popt_3rd[0],
+                        'tau1': popt_3rd[1],
+                        'tau2': popt_3rd[2],
+                        'tau3': popt_3rd[3],
+                        'mse': mse_3rd,
+                        'r2': r2_3rd,
+                        'aic': aic_3rd
                     },
                     'comparison': {
-                        'f_stat': f_stat,
-                        'p_value': p_value,
-                        'best_model': best_model
+                        'best_model': best_model,
+                        'aic_values': aic_values
                     },
                     'data': {
                         't': t.values,
                         'y_norm': y_norm,
                         'y_pred_1st': y_pred_1st,
-                        'y_pred_2nd': y_pred_2nd
+                        'y_pred_1std': y_pred_1std,
+                        'y_pred_2nd': y_pred_2nd,
+                        'y_pred_2ndd': y_pred_2ndd,
+                        'y_pred_3rd': y_pred_3rd
                     }
                 })
                 
@@ -382,73 +500,117 @@ class AdvancedTransferFunctionAnalyzer:
         
         return results
     
+    def detect_dead_zone_and_delay(self, t, y_norm, threshold=0.05):
+        """
+        Detecta zona muerta y retardo en la respuesta del sistema.
+        
+        Parameters:
+        t: array de tiempo
+        y_norm: array de respuesta normalizada
+        threshold: umbral para detectar el inicio de la respuesta (5% por defecto)
+        
+        Returns:
+        dead_zone: valor de la zona muerta (0 si no se detecta)
+        time_delay: retardo temporal detectado
+        """
+        # Encontrar el índice donde la respuesta supera el umbral
+        response_start_idx = np.where(y_norm > threshold)[0]
+        
+        if len(response_start_idx) > 0:
+            response_start_idx = response_start_idx[0]
+            time_delay = t.iloc[response_start_idx] if response_start_idx > 0 else 0
+            
+            # Si hay un retardo significativo, podríamos tener zona muerta
+            dead_zone = 1 if time_delay > 0.1 * t.max() else 0
+        else:
+            time_delay = 0
+            dead_zone = 0
+            
+        return dead_zone, time_delay
+    
     def display_results(self):
         if not self.results:
             self.results_text.delete(1.0, tk.END)
             self.results_text.insert(tk.END, "No se encontraron resultados válidos.")
             return
         
-        # Calcular promedios ponderados por calidad de ajuste
-        k_1st_avg = np.average([r['first_order']['K'] for r in self.results], 
-                              weights=[1/r['first_order']['mse'] for r in self.results if r['first_order']['mse'] > 0])
-        tau_1st_avg = np.average([r['first_order']['tau'] for r in self.results],
-                                weights=[1/r['first_order']['mse'] for r in self.results if r['first_order']['mse'] > 0])
-        
-        k_2nd_avg = np.average([r['second_order']['K'] for r in self.results],
-                              weights=[1/r['second_order']['mse'] for r in self.results if r['second_order']['mse'] > 0])
-        tau_2nd_avg = np.average([r['second_order']['tau'] for r in self.results],
-                                weights=[1/r['second_order']['mse'] for r in self.results if r['second_order']['mse'] > 0])
-        zeta_avg = np.average([r['second_order']['zeta'] for r in self.results],
-                             weights=[1/r['second_order']['mse'] for r in self.results if r['second_order']['mse'] > 0])
-        
         # Contar mejores modelos
         best_model_counts = {
-            'Primer orden': sum(1 for r in self.results if r['comparison']['best_model'] == 'Primer orden'),
-            'Segundo orden': sum(1 for r in self.results if r['comparison']['best_model'] == 'Segundo orden')
+            'Primer orden': 0,
+            'Primer orden con retardo': 0,
+            'Segundo orden': 0,
+            'Segundo orden con retardo': 0,
+            'Tercer orden': 0
         }
+        
+        for r in self.results:
+            best_model = r['comparison']['best_model']
+            best_model_counts[best_model] += 1
+        
+        # Calcular promedios ponderados por calidad de ajuste para el mejor modelo general
+        best_overall_model = max(best_model_counts, key=best_model_counts.get)
         
         # Generar texto de resultados
         result_text = "=== FUNCIÓN DE TRANSFERENCIA ESTIMADA ===\n\n"
         
-        result_text += f"Modelo de Primer Orden:\n"
-        result_text += f"  G(s) = {k_1st_avg:.4f} / ({tau_1st_avg:.4f}s + 1)\n\n"
+        result_text += f"Mejor modelo general: {best_overall_model}\n\n"
         
-        result_text += f"Modelo de Segundo Orden:\n"
-        if zeta_avg < 1:
-            result_text += f"  G(s) = {k_2nd_avg:.4f} * ωₙ² / (s² + {2*zeta_avg:.4f}ωₙs + ωₙ²)\n"
-            result_text += f"  donde ωₙ = {1/tau_2nd_avg:.4f} rad/s, ζ = {zeta_avg:.4f}\n\n"
-        else:
-            result_text += f"  G(s) = {k_2nd_avg:.4f} / ({tau_2nd_avg:.4f}s + 1)({zeta_avg:.4f}s + 1)\n\n"
-        
-        result_text += "=== COMPARACIÓN DE MODELOS ===\n\n"
-        result_text += f"Mejor modelo según segmentos:\n"
-        result_text += f"  Primer orden: {best_model_counts['Primer orden']} segmentos\n"
-        result_text += f"  Segundo orden: {best_model_counts['Segundo orden']} segmentos\n\n"
+        result_text += "=== DISTRIBUCIÓN DE MEJORES MODELOS POR SEGMENTO ===\n\n"
+        for model, count in best_model_counts.items():
+            result_text += f"{model}: {count} segmentos\n"
+        result_text += "\n"
         
         result_text += "=== DETALLES POR SEGMENTO ===\n\n"
         for r in self.results:
             result_text += f"Segmento {r['segment']} (PWM = {r['pwm']}):\n"
-            result_text += f"  Primer orden: K={r['first_order']['K']:.4f}, τ={r['first_order']['tau']:.4f}, R²={r['first_order']['r2']:.4f}\n"
-            result_text += f"  Segundo orden: K={r['second_order']['K']:.4f}, τ={r['second_order']['tau']:.4f}, ζ={r['second_order']['zeta']:.4f}, R²={r['second_order']['r2']:.4f}\n"
-            result_text += f"  Mejor modelo: {r['comparison']['best_model']} (p={r['comparison']['p_value']:.4f})\n\n"
+            result_text += f"  Zona muerta detectada: {'Sí' if r['dead_zone'] else 'No'}\n"
+            result_text += f"  Retardo temporal: {r['time_delay']:.4f}s\n"
+            result_text += f"  Mejor modelo: {r['comparison']['best_model']}\n"
+            
+            # Mostrar parámetros del mejor modelo
+            if r['comparison']['best_model'] == 'Primer orden':
+                params = r['first_order']
+                result_text += f"    K={params['K']:.4f}, τ={params['tau']:.4f}, R²={params['r2']:.4f}\n"
+            elif r['comparison']['best_model'] == 'Primer orden con retardo':
+                params = r['first_order_delay']
+                result_text += f"    K={params['K']:.4f}, τ={params['tau']:.4f}, L={params['L']:.4f}, R²={params['r2']:.4f}\n"
+            elif r['comparison']['best_model'] == 'Segundo orden':
+                params = r['second_order']
+                result_text += f"    K={params['K']:.4f}, τ={params['tau']:.4f}, ζ={params['zeta']:.4f}, R²={params['r2']:.4f}\n"
+            elif r['comparison']['best_model'] == 'Segundo orden con retardo':
+                params = r['second_order_delay']
+                result_text += f"    K={params['K']:.4f}, τ={params['tau']:.4f}, ζ={params['zeta']:.4f}, L={params['L']:.4f}, R²={params['r2']:.4f}\n"
+            elif r['comparison']['best_model'] == 'Tercer orden':
+                params = r['third_order']
+                result_text += f"    K={params['K']:.4f}, τ₁={params['tau1']:.4f}, τ₂={params['tau2']:.4f}, τ₃={params['tau3']:.4f}, R²={params['r2']:.4f}\n"
+            
+            result_text += "\n"
         
         self.results_text.delete(1.0, tk.END)
         self.results_text.insert(tk.END, result_text)
         
         # Generar texto de métricas
-        metrics_text = "=== MÉTRICAS DE AJUSTE ===\n\n"
+        metrics_text = "=== MÉTRICAS DE AJUSTE (PROMEDIO) ===\n\n"
         
-        metrics_text += "Error Cuadrático Medio (MSE) - Promedio ponderado:\n"
-        mse_1st_avg = np.average([r['first_order']['mse'] for r in self.results])
-        mse_2nd_avg = np.average([r['second_order']['mse'] for r in self.results])
-        metrics_text += f"  Primer orden: {mse_1st_avg:.6f}\n"
-        metrics_text += f"  Segundo orden: {mse_2nd_avg:.6f}\n\n"
+        # Calcular promedios para cada modelo
+        models = ['first_order', 'first_order_delay', 'second_order', 'second_order_delay', 'third_order']
+        model_names = ['Primer orden', 'Primer orden con retardo', 'Segundo orden', 
+                      'Segundo orden con retardo', 'Tercer orden']
         
-        metrics_text += "Coeficiente de Determinación (R²) - Promedio ponderado:\n"
-        r2_1st_avg = np.average([r['first_order']['r2'] for r in self.results])
-        r2_2nd_avg = np.average([r['second_order']['r2'] for r in self.results])
-        metrics_text += f"  Primer orden: {r2_1st_avg:.4f}\n"
-        metrics_text += f"  Segundo orden: {r2_2nd_avg:.4f}\n\n"
+        for i, model in enumerate(models):
+            mse_values = [r[model]['mse'] for r in self.results if model in r]
+            r2_values = [r[model]['r2'] for r in self.results if model in r]
+            aic_values = [r[model]['aic'] for r in self.results if model in r]
+            
+            if mse_values:
+                avg_mse = np.mean(mse_values)
+                avg_r2 = np.mean(r2_values)
+                avg_aic = np.mean(aic_values)
+                
+                metrics_text += f"{model_names[i]}:\n"
+                metrics_text += f"  MSE: {avg_mse:.6f}\n"
+                metrics_text += f"  R²: {avg_r2:.4f}\n"
+                metrics_text += f"  AIC: {avg_aic:.2f}\n\n"
         
         self.metrics_text.delete(1.0, tk.END)
         self.metrics_text.insert(tk.END, metrics_text)
@@ -461,62 +623,92 @@ class AdvancedTransferFunctionAnalyzer:
         self.ax4.clear()
         
         # Gráfico 1: Comparación de modelos para todos los segmentos
-        for r in self.results:
+        colors = plt.cm.tab10(np.linspace(0, 1, len(self.results)))
+        
+        for i, r in enumerate(self.results):
             t = r['data']['t']
             y_norm = r['data']['y_norm']
-            y_pred_1st = r['data']['y_pred_1st']
-            y_pred_2nd = r['data']['y_pred_2nd']
+            y_pred_best = r['data'][f'y_pred_{self.get_model_abbreviation(r["comparison"]["best_model"])}']
             
-            self.ax1.plot(t, y_norm, 'o', markersize=2, alpha=0.7)
-            self.ax1.plot(t, y_pred_1st, '-', linewidth=1, alpha=0.7)
-            self.ax1.plot(t, y_pred_2nd, '--', linewidth=1, alpha=0.7)
+            self.ax1.plot(t, y_norm, 'o', markersize=2, alpha=0.7, color=colors[i])
+            self.ax1.plot(t, y_pred_best, '-', linewidth=1, alpha=0.7, color=colors[i])
         
         self.ax1.set_xlabel('Tiempo (s)')
         self.ax1.set_ylabel('Respuesta Normalizada')
-        self.ax1.set_title('Comparación de Ajustes por Segmento')
-        self.ax1.legend(['Datos', '1er Orden', '2do Orden'], loc='best')
+        self.ax1.set_title('Comparación de Ajustes por Segmento (Mejor Modelo)')
+        self.ax1.legend(['Datos', 'Mejor Modelo'], loc='best')
         self.ax1.grid(True, alpha=0.3)
         
-        # Gráfico 2: Error de predicción
-        errors_1st = []
-        errors_2nd = []
+        # Gráfico 2: Distribución de mejores modelos
+        best_model_counts = {
+            'Primer orden': 0,
+            'Primer orden con retardo': 0,
+            'Segundo orden': 0,
+            'Segundo orden con retardo': 0,
+            'Tercer orden': 0
+        }
         
         for r in self.results:
-            errors_1st.extend(r['data']['y_norm'] - r['data']['y_pred_1st'])
-            errors_2nd.extend(r['data']['y_norm'] - r['data']['y_pred_2nd'])
+            best_model = r['comparison']['best_model']
+            best_model_counts[best_model] += 1
         
-        self.ax2.hist(errors_1st, bins=30, alpha=0.7, label='1er Orden')
-        self.ax2.hist(errors_2nd, bins=30, alpha=0.7, label='2do Orden')
-        self.ax2.set_xlabel('Error de Predicción')
-        self.ax2.set_ylabel('Frecuencia')
-        self.ax2.set_title('Distribución de Errores')
-        self.ax2.legend()
+        models = list(best_model_counts.keys())
+        counts = list(best_model_counts.values())
+        
+        self.ax2.bar(models, counts, alpha=0.7)
+        self.ax2.set_xlabel('Modelo')
+        self.ax2.set_ylabel('Número de Segmentos')
+        self.ax2.set_title('Distribución de Mejores Modelos')
+        self.ax2.tick_params(axis='x', rotation=45)
         self.ax2.grid(True, alpha=0.3)
         
         # Gráfico 3: Comparación de R²
         r2_1st = [r['first_order']['r2'] for r in self.results]
+        r2_1std = [r['first_order_delay']['r2'] for r in self.results]
         r2_2nd = [r['second_order']['r2'] for r in self.results]
+        r2_2ndd = [r['second_order_delay']['r2'] for r in self.results]
+        r2_3rd = [r['third_order']['r2'] for r in self.results]
         
         segments = range(1, len(self.results) + 1)
-        self.ax3.plot(segments, r2_1st, 'o-', label='1er Orden')
-        self.ax3.plot(segments, r2_2nd, 's-', label='2do Orden')
+        
+        self.ax3.plot(segments, r2_1st, 'o-', label='1er Orden', alpha=0.7)
+        self.ax3.plot(segments, r2_1std, 's-', label='1er Orden con retardo', alpha=0.7)
+        self.ax3.plot(segments, r2_2nd, '^-', label='2do Orden', alpha=0.7)
+        self.ax3.plot(segments, r2_2ndd, 'd-', label='2do Orden con retardo', alpha=0.7)
+        self.ax3.plot(segments, r2_3rd, 'v-', label='3er Orden', alpha=0.7)
+        
         self.ax3.set_xlabel('Segmento')
         self.ax3.set_ylabel('R²')
         self.ax3.set_title('Comparación de Calidad de Ajuste (R²)')
-        self.ax3.legend()
+        self.ax3.legend(loc='best')
         self.ax3.grid(True, alpha=0.3)
         
-        # Gráfico 4: Parámetros del modelo de segundo orden
-        zeta_values = [r['second_order']['zeta'] for r in self.results]
-        self.ax4.plot(segments, zeta_values, 'o-')
+        # Gráfico 4: Parámetros de retardo y zona muerta
+        time_delays = [r['time_delay'] for r in self.results]
+        dead_zones = [r['dead_zone'] for r in self.results]
+        
+        self.ax4.plot(segments, time_delays, 'o-', label='Retardo (s)')
+        self.ax4.plot(segments, dead_zones, 's-', label='Zona muerta (0/1)')
         self.ax4.set_xlabel('Segmento')
-        self.ax4.set_ylabel('ζ (Coeficiente de Amortiguamiento)')
-        self.ax4.set_title('Parámetro ζ del Modelo de Segundo Orden')
+        self.ax4.set_ylabel('Valor')
+        self.ax4.set_title('Retardo y Zona Muerta por Segmento')
+        self.ax4.legend()
         self.ax4.grid(True, alpha=0.3)
         
         # Ajustar diseño y dibujar
         self.fig.tight_layout()
         self.canvas.draw()
+    
+    def get_model_abbreviation(self, model_name):
+        """Convierte el nombre del modelo a su abreviatura para acceder a los datos."""
+        abbreviations = {
+            'Primer orden': '1st',
+            'Primer orden con retardo': '1std',
+            'Segundo orden': '2nd',
+            'Segundo orden con retardo': '2ndd',
+            'Tercer orden': '3rd'
+        }
+        return abbreviations.get(model_name, '1st')
     
     def export_results(self):
         if not self.results:
@@ -533,21 +725,27 @@ class AdvancedTransferFunctionAnalyzer:
                 # Crear DataFrame con resultados
                 export_data = []
                 for r in self.results:
-                    export_data.append({
+                    row = {
                         'segmento': r['segment'],
                         'pwm': r['pwm'],
-                        'k_1er_orden': r['first_order']['K'],
-                        'tau_1er_orden': r['first_order']['tau'],
-                        'r2_1er_orden': r['first_order']['r2'],
-                        'mse_1er_orden': r['first_order']['mse'],
-                        'k_2do_orden': r['second_order']['K'],
-                        'tau_2do_orden': r['second_order']['tau'],
-                        'zeta_2do_orden': r['second_order']['zeta'],
-                        'r2_2do_orden': r['second_order']['r2'],
-                        'mse_2do_orden': r['second_order']['mse'],
+                        'zona_muerta': r['dead_zone'],
+                        'retardo_temporal': r['time_delay'],
                         'mejor_modelo': r['comparison']['best_model'],
-                        'valor_p': r['comparison']['p_value']
-                    })
+                    }
+                    
+                    # Agregar parámetros de todos los modelos
+                    models = ['first_order', 'first_order_delay', 'second_order', 'second_order_delay', 'third_order']
+                    model_names = ['1er_orden', '1er_orden_retardo', '2do_orden', '2do_orden_retardo', '3er_orden']
+                    
+                    for i, model in enumerate(models):
+                        prefix = model_names[i]
+                        if model in r:
+                            params = r[model]
+                            for key, value in params.items():
+                                if key != 'aic':  # Excluir AIC para simplificar
+                                    row[f'{prefix}_{key}'] = value
+                    
+                    export_data.append(row)
                 
                 df = pd.DataFrame(export_data)
                 df.to_csv(file_path, index=False)

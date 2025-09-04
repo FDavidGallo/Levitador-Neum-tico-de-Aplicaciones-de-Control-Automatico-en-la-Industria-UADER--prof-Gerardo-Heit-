@@ -1,40 +1,40 @@
-#include <HCSR04.h> // Llamamos a la función para medir la altura
-#include <PID_v1.h> // Llamamos a la función para implementar el PID
+#include <HCSR04.h> // Library for ultrasonic sensor
+#include <PID_v1.h> // PID library
 
-// Pines
+// Pins
 byte triggerPin = 13;
 byte echoPin = 12;
-byte pwmPin = 6; // De aca va para el cooler
+byte pwmPin = 6; // PWM pin for cooler
 
-// Variables PID
-double setpoint = 50; //
+// PID variables
+double setpoint = 50; // Setpoint in percentage
 double input = 0;
 double output = 0;
 
-// Parámetros PID (ajustar según necesidades)
-double Kp = 0.21;
-double Ki = 5.0;
-double Kd = 1.0;
+// PID parameters based on Ziegler-Nichols tuning for the given transfer function
+double Kp = 0.534;   // Proportional gain
+double Ki = 0.0817;    // Integral gain
+double Kd = 0.034;    // Derivative gain
 
-PID myPID(&input, &output, &setpoint, Kp, Ki, Kd, DIRECT); // Instanciamos el objeto PID
+PID myPID(&input, &output, &setpoint, Kp, Ki, Kd, DIRECT); // Create PID instance
 
-// Variables para calibración
+// Calibration variables
 double minDistance = 0.0;
 double maxDistance = 0.0;
 double currentDistance = 0.0;
 
-// Filtro promedio móvil
+// Moving average filter
 const int filterSize = 10;
 double distanceBuffer[filterSize];
 int bufferIndex = 0;
 double distanceSum = 0.0;
 
-// Tiempos de calibración
-const unsigned long calibZeroTime = 6000; //Peramo' 6 segundos por calibracion
-const unsigned long calibMaxTime = 6000;
-const unsigned long postCalibTime = 3500; // Pa que la pelota quede en 0 al iniciar
+// Calibration times
+const unsigned long calibZeroTime = 6000; // 6 seconds for zero calibration
+const unsigned long calibMaxTime = 6000;  // 6 seconds for max calibration
+const unsigned long postCalibTime = 3500; // 3.5 seconds for post-calibration
 
-// Estados del sistema
+// System states
 enum SystemState {
   CALIB_ZERO,
   CALIB_MAX,
@@ -50,14 +50,15 @@ void setup() {
   HCSR04.begin(triggerPin, echoPin);
   pinMode(pwmPin, OUTPUT);
   
-  // Inicializar filtro
+  // Initialize filter
   for (int i = 0; i < filterSize; i++) {
     distanceBuffer[i] = 0.0;
   }
   
-  // Configurar PID
+  // Configure PID
   myPID.SetMode(AUTOMATIC);
   myPID.SetOutputLimits(0, 255);
+  myPID.SetSampleTime(40); // Set sample time to 40 ms to match loop delay
   
   analogWrite(pwmPin, 0);
   stateStartTime = millis();
@@ -85,7 +86,7 @@ void loop() {
   }
   
   processSerialCommands();
-  delay(40);
+  delay(40); // Main loop delay
 }
 
 void applyMovingAverageFilter(double* newValue) {
@@ -130,7 +131,7 @@ void handleNormalOperation() {
   input = calculatePercentage();
   myPID.Compute();
   analogWrite(pwmPin, output);
-  Serial.println(input, 2);
+  Serial.println(input, 2); // Print current height percentage
 }
 
 double calculatePercentage() {
@@ -146,13 +147,13 @@ void processSerialCommands() {
     input.trim();
     
     if (currentState == NORMAL_OPERATION) {
-      // En estado normal, recibir setpoint (0-100)
+      // Set setpoint during normal operation
       int newSetpoint = input.toInt();
       if (newSetpoint >= 0 && newSetpoint <= 100) {
         setpoint = newSetpoint;
       }
     } else {
-      // Durante calibración, control manual del PWM (0-255)
+      // Manual PWM control during calibration
       int newPwm = input.toInt();
       if (newPwm >= 0 && newPwm <= 255) {
         analogWrite(pwmPin, newPwm);
