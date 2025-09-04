@@ -10,10 +10,9 @@ double setpoint = 50; // Setpoint in percentage
 double input = 0;
 double output = 0;
 
-// PID parameters based on Ziegler-Nichols tuning for the given transfer function
-double Kp = 1.65;   // Proportional gain
-double Ki = 1.38;  // Integral gain
-double Kd = 0.99;   // Derivative gain
+double Kp = 0.45;   // Proportional gain
+double Ki = 0.5;  // Integral gain
+double Kd = 0.7;   // Derivative gain
 
 // Anti-windup parameters
 double Tt = 3;     // Tracking time constant (seconds)
